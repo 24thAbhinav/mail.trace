@@ -76,3 +76,9 @@ frontend/.env.*
 # ── Misc runtime ─────────────────────────────────────
 *.pid
 celerybeat-schedule
+.neon
+
+# ── Agent / skill scaffolding ─────────────────────────
+.agents/
+neon.ts
+skills-lock.json
