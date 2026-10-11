@@ -72,6 +72,54 @@ flowchart TD
 
 ---
 
+## Google OAuth Setup (Local Testing)
+
+The backend exposes two endpoints to connect your own Gmail account:
+
+* `GET /auth/google` — redirects to Google's consent screen.
+* `GET /auth/google/callback` — validates OAuth state, exchanges the code, and stores the token.
+
+### 1. Create OAuth credentials
+
+1. Open the [Google Cloud Console](https://console.cloud.google.com/apis/credentials).
+2. Create an **OAuth 2.0 Client ID** of type **Web application**.
+3. Add an authorized redirect URI: `http://localhost:8000/auth/google/callback`.
+4. Copy the **Client ID** and **Client secret**.
+
+### 2. Configure the backend
+
+Add these to `backend/.env`:
+
+```env
+GOOGLE_CLIENT_ID=your_client_id.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=your_client_secret
+GOOGLE_REDIRECT_URI=http://localhost:8000/auth/google/callback
+```
+
+`GMAIL_TOKEN_PATH` is optional (defaults to `backend/token.json`).
+
+### 3. Run and authorize
+
+```bash
+cd backend
+source .venv/bin/activate
+uvicorn app.main:app --reload --port 8000
+```
+
+Open `http://localhost:8000/auth/google` and complete the Google consent flow. On success the callback stores the token (including the refresh token) to `backend/token.json` with owner-only permissions and returns `{"status": "authorized"}`. The token file is gitignored and never logged or returned by the API.
+
+### Tests
+
+```bash
+cd backend
+.venv/bin/pip install pytest
+.venv/bin/python -m pytest tests/
+```
+
+### Multi-user notes
+
+This connects a single Gmail account (your own). To support multiple users you would: store tokens per user (a `users`/`oauth_tokens` table keyed by user id), associate each Gmail watch/sync and application with that user, and add authentication so users only see their own data. None of that is needed for single-account local testing.
+
 ## Setup and Installation
 
 ### Prerequisites
