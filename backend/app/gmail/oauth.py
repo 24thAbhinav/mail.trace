@@ -1,8 +1,4 @@
-"""Google Gmail OAuth 2.0 (read-only) for a single-user local setup.
-
-State is validated via an HTTP-only cookie to prevent CSRF. Tokens are stored
-to a file with owner-only permissions and are never logged or returned by the API.
-"""
+"""Google Gmail OAuth 2.0 (read-only) for a single-user local setup."""
 
 from __future__ import annotations
 
@@ -55,7 +51,7 @@ class GmailAuthSettings:
         if missing:
             raise GmailAuthError(f"Missing required env var(s): {', '.join(missing)}")
 
-        root = Path(__file__).resolve().parents[2]  # backend/
+        root = Path(__file__).resolve().parents[2]
         token_path = Path(os.getenv("GMAIL_TOKEN_PATH", "token.json"))
         if not token_path.is_absolute():
             token_path = root / token_path
@@ -93,8 +89,8 @@ def build_flow(settings: GmailAuthSettings, code_verifier: str | None = None) ->
 def authorization_url(settings: GmailAuthSettings, state: str) -> tuple[str, str]:
     """Build the Google consent URL requesting read-only + offline access.
 
-    Returns ``(url, code_verifier)``. The code_verifier is required at the
-    token exchange step (PKCE), so the caller must persist it between the two.
+    Returns ``(url, code_verifier)``; the caller must persist the verifier
+    between the start of the flow and the token exchange (PKCE).
     """
     flow = build_flow(settings)
     url, _ = flow.authorization_url(
@@ -134,7 +130,7 @@ def exchange_code(
     flow = build_flow(settings, code_verifier=code_verifier)
     try:
         flow.fetch_token(code=code)
-    except Exception as exc:  # oauthlib/gcloud raise assorted errors on bad codes
+    except Exception as exc:
         raise GmailAuthError(f"Token exchange failed: {exc}") from exc
     credentials = flow.credentials
     save_credentials(settings, credentials)

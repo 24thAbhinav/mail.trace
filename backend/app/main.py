@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import secrets
 from contextlib import asynccontextmanager
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.db.database import create_db_and_tables
@@ -19,6 +21,7 @@ from app.gmail.oauth import (
     exchange_code,
     generate_state,
 )
+from app.gmail.service import register_watch
 
 
 @asynccontextmanager
@@ -29,8 +32,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Job Tracker", lifespan=lifespan)
 
-auth_router = APIRouter(prefix="/auth", tags=["auth"])
-
 
 def get_settings() -> GmailAuthSettings:
     try:
@@ -39,7 +40,7 @@ def get_settings() -> GmailAuthSettings:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@auth_router.get("/google")
+@app.get("/auth/google", tags=["auth"])
 def google_oauth_start(
     request: Request,
     settings: GmailAuthSettings = Depends(get_settings),
@@ -65,7 +66,7 @@ def google_oauth_start(
     return response
 
 
-@auth_router.get("/google/callback")
+@app.get("/auth/google/callback", tags=["auth"])
 def google_oauth_callback(
     request: Request,
     code: str | None = None,
@@ -86,7 +87,9 @@ def google_oauth_callback(
         or not expected_state
         or not secrets.compare_digest(state, expected_state)
     ):
-        raise HTTPException(status_code=400, detail="Invalid or missing 'state' parameter.")
+        raise HTTPException(
+            status_code=400, detail="Invalid or missing 'state' parameter."
+        )
 
     code_verifier = request.cookies.get(CODE_VERIFIER_COOKIE)
     try:
@@ -100,4 +103,33 @@ def google_oauth_callback(
     return response
 
 
-app.include_router(auth_router)
+@app.post("/gmail/watch")
+def start_gmail_watch(
+    settings: GmailAuthSettings = Depends(get_settings),
+):
+    try:
+        return register_watch(settings)
+    except GmailAuthError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/pubsub/push")
+async def pubsub_push(request: Request):
+    try:
+        body = await request.json()
+        message = body["message"]
+        data = message["data"]
+
+        notification = json.loads(base64.b64decode(data).decode("utf-8"))
+        print("Pub/Sub notification:", notification)
+
+        email_address = notification["emailAddress"]
+        history_id = notification["historyId"]
+
+        return {"status": "ok"}
+
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Invalid Pub/Sub payload"},
+        )
