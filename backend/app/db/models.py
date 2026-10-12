@@ -1,10 +1,12 @@
 """SQLModel ORM models for the mail.trace schema.
 
-Three tables:
+Five tables:
 
 * ``applications``       -- one row per job opportunity (the "first entry")
 * ``application_events`` -- the "updates" table (one row per follow-up email)
 * ``processed_emails``   -- ingestion dedup / audit log
+* ``sync_state``         -- per-mailbox Gmail history cursor for incremental sync
+* ``emails``             -- raw synced emails (deduped by Gmail message id)
 """
 
 from __future__ import annotations
@@ -119,5 +121,42 @@ class ProcessedEmail(SQLModel, table=True):
     error: str | None = None
 
     processed_at: datetime = Field(
+        default_factory=utcnow, sa_type=DateTime(timezone=True)
+    )
+
+
+class SyncState(SQLModel, table=True):
+    """Persistent Gmail history cursor, one row per watched mailbox."""
+
+    __tablename__ = "sync_state"
+
+    id: int | None = Field(default=None, primary_key=True)
+    email_address: str = Field(unique=True, index=True)
+    # Gmail history IDs are opaque, monotonic integers; keep as string to avoid
+    # precision loss across API calls and comparisons.
+    history_id: str
+
+    updated_at: datetime = Field(
+        default_factory=utcnow, sa_type=DateTime(timezone=True)
+    )
+
+
+class Email(SQLModel, table=True):
+    """A raw email fetched during Gmail sync, deduped by message id."""
+
+    __tablename__ = "emails"
+
+    id: int | None = Field(default=None, primary_key=True)
+
+    message_id: str = Field(unique=True, index=True)  # Gmail message id
+    thread_id: str | None = None
+
+    sender_email: str | None = None
+    recipient_email: str | None = None
+    subject: str | None = None
+    date: str | None = None  # raw "Date" header value
+    body: str | None = None
+
+    received_at: datetime = Field(
         default_factory=utcnow, sa_type=DateTime(timezone=True)
     )

@@ -9,8 +9,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
+from sqlmodel import Session
 
-from app.db.database import create_db_and_tables
+from app.db.database import create_db_and_tables, get_session
 from app.gmail.oauth import (
     CODE_VERIFIER_COOKIE,
     STATE_COOKIE,
@@ -21,7 +22,13 @@ from app.gmail.oauth import (
     exchange_code,
     generate_state,
 )
-from app.gmail.service import register_watch
+from app.gmail.service import build_service, register_watch
+from app.gmail.sync import (
+    GmailSyncError,
+    HistoryExpiredError,
+    full_sync,
+    sync_history,
+)
 
 
 @asynccontextmanager
@@ -38,6 +45,11 @@ def get_settings() -> GmailAuthSettings:
         return GmailAuthSettings.from_env()
     except GmailAuthError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def get_gmail_service(settings: GmailAuthSettings = Depends(get_settings)):
+    """FastAPI dependency that yields an authenticated Gmail API client."""
+    return build_service(settings)
 
 
 @app.get("/auth/google", tags=["auth"])
@@ -106,30 +118,55 @@ def google_oauth_callback(
 @app.post("/gmail/watch")
 def start_gmail_watch(
     settings: GmailAuthSettings = Depends(get_settings),
+    session: Session = Depends(get_session),
 ):
     try:
-        return register_watch(settings)
+        return register_watch(settings, session)
     except GmailAuthError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.post("/pubsub/push")
-async def pubsub_push(request: Request):
+async def pubsub_push(
+    request: Request,
+    session: Session = Depends(get_session),
+    service=Depends(get_gmail_service),
+):
     try:
         body = await request.json()
-        message = body["message"]
-        data = message["data"]
-
+        data = body["message"]["data"]
         notification = json.loads(base64.b64decode(data).decode("utf-8"))
-        print("Pub/Sub notification:", notification)
-
         email_address = notification["emailAddress"]
-        history_id = notification["historyId"]
-
-        return {"status": "ok"}
-
     except (ValueError, KeyError, TypeError, json.JSONDecodeError):
         return JSONResponse(
             status_code=400,
             content={"detail": "Invalid Pub/Sub payload"},
         )
+
+    try:
+        # The stored cursor is the authoritative startHistoryId; the
+        # notification's historyId is only a fallback for a fresh mailbox.
+        sync_history(
+            service,
+            session,
+            email_address,
+            fallback_history_id=notification.get("historyId"),
+        )
+    except HistoryExpiredError:
+        # Cursor is too old for incremental sync: recover with a full resync.
+        try:
+            full_sync(service, session, email_address)
+        except Exception:
+            session.rollback()
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Gmail resynchronization failed"},
+            )
+    except GmailSyncError as exc:
+        session.rollback()
+        return JSONResponse(status_code=500, content={"detail": str(exc)})
+    except Exception:
+        session.rollback()
+        return JSONResponse(status_code=500, content={"detail": "Gmail sync failed"})
+
+    return {"status": "ok"}

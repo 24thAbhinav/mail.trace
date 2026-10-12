@@ -1,0 +1,76 @@
+"""Tests for the Pub/Sub push endpoint."""
+
+from __future__ import annotations
+
+import base64
+import json
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlmodel import Session, select
+
+import app.db.database as db
+from app.db.models import Email
+from app.gmail.sync import get_cursor
+from app.main import app, get_gmail_service
+
+from .conftest import make_404, make_message
+
+
+def _payload(email_address="a@example.com", history_id="123"):
+    notification = {"emailAddress": email_address, "historyId": history_id}
+    data = base64.b64encode(json.dumps(notification).encode()).decode()
+    return {"message": {"data": data}}
+
+
+@pytest.fixture()
+def client(engine, fake_gmail, monkeypatch):
+    monkeypatch.setattr(db, "engine", engine)
+
+    def _service():
+        return fake_gmail
+
+    app.dependency_overrides[get_gmail_service] = _service
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.clear()
+
+
+def test_pubsub_push_ok(client):
+    response = client.post("/pubsub/push", json=_payload())
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_pubsub_push_invalid_payload_returns_400(client):
+    response = client.post("/pubsub/push", json={"message": {"data": "!!bad!!"}})
+    assert response.status_code == 400
+
+
+def test_pubsub_push_missing_message_returns_400(client):
+    response = client.post("/pubsub/push", json={"foo": "bar"})
+    assert response.status_code == 400
+
+
+def test_pubsub_push_sync_failure_returns_500(client, fake_gmail):
+    fake_gmail.history_error = Exception("transient failure")
+    response = client.post("/pubsub/push", json=_payload())
+    assert response.status_code == 500
+
+
+def test_pubsub_push_expired_history_triggers_full_sync(client, fake_gmail, engine):
+    fake_gmail.history_error = make_404()
+    fake_gmail.list_pages = [{"messages": [{"id": "m1"}]}]
+    fake_gmail.messages = {"m1": make_message("m1", subject="one")}
+    fake_gmail.profile_response = {
+        "emailAddress": "a@example.com",
+        "historyId": "500",
+    }
+
+    response = client.post("/pubsub/push", json=_payload())
+    assert response.status_code == 200
+
+    with Session(engine) as s:
+        emails = s.exec(select(Email)).all()
+        assert {e.message_id for e in emails} == {"m1"}
+        assert get_cursor(s, "a@example.com") == "500"
