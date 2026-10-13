@@ -1,6 +1,6 @@
-# Job Tracker
+# mail.trace
 
-Job Tracker connects to your Gmail inbox, reads job-related emails, and organizes them into a clean dashboard.
+`mail.trace` connects to your Gmail inbox, reads job-related emails, and organizes them into a clean dashboard.
 
 Instead of manually updating a spreadsheet, the app automatically detects when you apply for a job or receive an update (test invite, interview schedule, rejection, or offer). It extracts the company, role, interview links, deadlines, and notes, and updates your dashboard in real time.
 
