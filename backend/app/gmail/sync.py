@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 
 from googleapiclient.errors import HttpError
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.db.models import Email, SyncState, utcnow
@@ -74,13 +75,31 @@ def _lock_cursor(session: Session, email_address: str) -> str | None:
 
     ``with_for_update()`` serializes concurrent syncs for the same mailbox on
     PostgreSQL; on SQLite it is a no-op (tests rely on single-threaded flows).
+
+    Handles the first-sync case where no row exists yet: a placeholder row is
+    inserted (racing the unique constraint on ``email_address``) so concurrent
+    first syncs still serialize. Returns ``None`` when no real cursor exists.
     """
     row = session.exec(
         select(SyncState)
         .where(SyncState.email_address == email_address)
         .with_for_update()
     ).first()
-    return row.history_id if row else None
+    if row is None:
+        row = SyncState(email_address=email_address, history_id="")
+        session.add(row)
+        try:
+            session.flush()
+        except IntegrityError:
+            session.rollback()
+            row = session.exec(
+                select(SyncState)
+                .where(SyncState.email_address == email_address)
+                .with_for_update()
+            ).first()
+            if row is None:
+                raise
+    return row.history_id or None
 
 
 # --- email extraction ---------------------------------------------------------
@@ -294,8 +313,16 @@ def full_sync(service, session: Session, email_address: str) -> None:
     """Safe resynchronization after a history cursor has expired.
 
     Re-reads the entire mailbox (deduped by message id, so no email is lost) and
-    re-anchors the cursor to the mailbox's current history id.
+    re-anchors the cursor to the mailbox's current history id. The cursor is
+    read *before* listing so anything arriving mid-scan is recovered by the
+    next incremental sync (never missed, only possibly re-fetched).
     """
+    _lock_cursor(session, email_address)  # serialize with concurrent sync_history
+
+    # Anchor the cursor to a point at or before every message we list.
+    profile = service.users().getProfile(userId="me").execute()
+    history_id = profile.get("historyId")
+
     message_ids: list[str] = []
     page_token: str | None = None
 
@@ -314,8 +341,6 @@ def full_sync(service, session: Session, email_address: str) -> None:
     for message_id in message_ids:
         _fetch_and_persist(service, session, message_id)
 
-    profile = service.users().getProfile(userId="me").execute()
-    history_id = profile.get("historyId")
     if history_id is not None:
         set_cursor(session, email_address, str(history_id))
 

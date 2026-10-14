@@ -11,7 +11,7 @@ from sqlmodel import Session, select
 
 import app.db.database as db
 from app.db.models import Email
-from app.gmail.sync import get_cursor
+from app.gmail.sync import get_cursor, set_cursor
 from app.main import app, get_gmail_service
 
 from .conftest import make_404, make_message
@@ -56,6 +56,38 @@ def test_pubsub_push_sync_failure_returns_500(client, fake_gmail):
     fake_gmail.history_error = Exception("transient failure")
     response = client.post("/pubsub/push", json=_payload())
     assert response.status_code == 500
+
+
+def test_pubsub_push_duplicate_notification_no_duplicate_emails(client, fake_gmail, engine):
+    fake_gmail.history_pages = [
+        {"historyId": "100", "history": [{"messagesAdded": [{"message": {"id": "m1"}}]}]}
+    ]
+    fake_gmail.messages = {"m1": make_message("m1", subject="one")}
+
+    payload = _payload()
+    assert client.post("/pubsub/push", json=payload).status_code == 200
+    assert client.post("/pubsub/push", json=payload).status_code == 200
+
+    with Session(engine) as s:
+        emails = s.exec(select(Email)).all()
+        assert len(emails) == 1
+        assert emails[0].message_id == "m1"
+
+
+def test_pubsub_push_delayed_notification_uses_stored_cursor(client, fake_gmail, engine):
+    with Session(engine) as s:
+        set_cursor(s, "a@example.com", "999")
+        s.commit()
+
+    # A stale/delayed notification carries an older historyId; the stored
+    # cursor (999) must win so we do not re-fetch already-seen history.
+    fake_gmail.history_pages = [{"historyId": "1000", "history": []}]
+
+    response = client.post(
+        "/pubsub/push", json=_payload(history_id="100")
+    )
+    assert response.status_code == 200
+    assert fake_gmail.history_list_kwargs[0]["startHistoryId"] == "999"
 
 
 def test_pubsub_push_expired_history_triggers_full_sync(client, fake_gmail, engine):

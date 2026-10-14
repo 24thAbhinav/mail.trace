@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from sqlmodel import Session, select
 
-from app.db.models import Email
+from app.db.models import Email, EmailStatus
 from app.gmail.sync import (
     GmailSyncError,
     HistoryExpiredError,
@@ -180,3 +180,148 @@ def test_full_sync_lists_fetches_and_reanchors(engine, fake_gmail):
         emails = s.exec(select(Email)).all()
         assert {e.message_id for e in emails} == {"m1", "m2"}
         assert get_cursor(s, "a@example.com") == "500"
+
+
+def test_sync_persists_emails_as_pending(engine, fake_gmail):
+    with Session(engine) as s:
+        set_cursor(s, "a@example.com", "50")
+        s.commit()
+
+    fake_gmail.history_pages = [
+        {"historyId": "100", "history": [history_record("m1", "m2")]}
+    ]
+    fake_gmail.messages = {
+        "m1": make_message("m1", subject="one"),
+        "m2": make_message("m2", subject="two"),
+    }
+
+    with Session(engine) as s:
+        sync_history(fake_gmail, s, "a@example.com")
+
+    with Session(engine) as s:
+        emails = s.exec(select(Email)).all()
+        assert {e.message_id for e in emails} == {"m1", "m2"}
+        assert all(e.status == EmailStatus.PENDING for e in emails)
+
+
+def test_sync_persists_full_email_fields(engine, fake_gmail):
+    with Session(engine) as s:
+        set_cursor(s, "a@example.com", "50")
+        s.commit()
+
+    fake_gmail.history_pages = [
+        {"historyId": "100", "history": [history_record("m1")]}
+    ]
+    fake_gmail.messages = {
+        "m1": make_message(
+            "m1",
+            thread_id="t1",
+            sender="Recruiter <recruiter@acme.com>",
+            recipient="me@example.com",
+            subject="Offer letter",
+            date="Mon, 01 Jan 2026 10:00:00 +0000",
+            body="Congratulations, here is your offer.",
+        )
+    }
+
+    with Session(engine) as s:
+        sync_history(fake_gmail, s, "a@example.com")
+
+    with Session(engine) as s:
+        email = s.exec(select(Email)).one()
+        assert email.message_id == "m1"
+        assert email.thread_id == "t1"
+        assert email.sender_email == "Recruiter <recruiter@acme.com>"
+        assert email.recipient_email == "me@example.com"
+        assert email.subject == "Offer letter"
+        assert email.date == "Mon, 01 Jan 2026 10:00:00 +0000"
+        assert email.body == "Congratulations, here is your offer."
+        assert email.status == EmailStatus.PENDING
+
+
+def test_sync_commit_failure_does_not_advance_cursor(engine, fake_gmail, monkeypatch):
+    with Session(engine) as s:
+        set_cursor(s, "a@example.com", "50")
+        s.commit()
+
+    fake_gmail.history_pages = [
+        {"historyId": "100", "history": [history_record("m1")]}
+    ]
+    fake_gmail.messages = {"m1": make_message("m1", subject="one")}
+
+    # Simulate a commit failure: the cursor and the email are written in the
+    # same transaction, so neither may become durable independently.
+    sess = Session(engine)
+
+    def fail_commit():
+        raise RuntimeError("simulated database commit failure")
+
+    monkeypatch.setattr(sess, "commit", fail_commit)
+
+    with pytest.raises(RuntimeError):
+        sync_history(fake_gmail, sess, "a@example.com")
+    sess.rollback()
+
+    with Session(engine) as s:
+        assert get_cursor(s, "a@example.com") == "50"
+        assert s.exec(select(Email)).all() == []
+
+
+def test_reprocessing_does_not_reset_status(engine, fake_gmail):
+    with Session(engine) as s:
+        set_cursor(s, "a@example.com", "50")
+        s.add(Email(message_id="m1", subject="done", status=EmailStatus.COMPLETED))
+        s.commit()
+
+    fake_gmail.history_pages = [
+        {"historyId": "100", "history": [history_record("m1")]}
+    ]
+    fake_gmail.messages = {"m1": make_message("m1", subject="done")}
+
+    with Session(engine) as s:
+        sync_history(fake_gmail, s, "a@example.com")
+
+    with Session(engine) as s:
+        email = s.exec(select(Email)).one()
+        assert email.status == EmailStatus.COMPLETED  # not reset to pending
+
+
+def test_full_sync_reads_history_id_before_listing(engine):
+    order = []
+
+    class _Profile:
+        def execute(self):
+            order.append("profile")
+            return {"emailAddress": "a@example.com", "historyId": "500"}
+
+    class _List:
+        def execute(self):
+            order.append("list")
+            return {"messages": []}
+
+    class _Messages:
+        def list(self, **kw):
+            return _List()
+
+        def get(self, **kw):
+            class _Get:
+                def execute(self):
+                    return {"id": "x", "payload": {}}
+
+            return _Get()
+
+    class _Users:
+        def getProfile(self, **kw):
+            return _Profile()
+
+        def messages(self):
+            return _Messages()
+
+    class _Svc:
+        def users(self):
+            return _Users()
+
+    with Session(engine) as s:
+        full_sync(_Svc(), s, "a@example.com")
+
+    assert order == ["profile", "list"]

@@ -141,8 +141,25 @@ class SyncState(SQLModel, table=True):
     )
 
 
+class EmailStatus(str, Enum):
+    """Processing state for a persisted raw email.
+
+    Sync only writes ``PENDING``; a future async worker transitions through
+    ``PROCESSING`` -> ``COMPLETED`` / ``FAILED``.
+    """
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class Email(SQLModel, table=True):
-    """A raw email fetched during Gmail sync, deduped by message id."""
+    """A raw email fetched during Gmail sync, deduped by message id.
+
+    Kept separate from ``Application`` (structured job records) so sync can
+    ingest emails without running the LangGraph workflow.
+    """
 
     __tablename__ = "emails"
 
@@ -158,5 +175,11 @@ class Email(SQLModel, table=True):
     body: str | None = None
 
     received_at: datetime = Field(
+        default_factory=utcnow, sa_type=DateTime(timezone=True)
+    )
+
+    status: EmailStatus = Field(default=EmailStatus.PENDING, index=True)
+    error: str | None = None
+    updated_at: datetime = Field(
         default_factory=utcnow, sa_type=DateTime(timezone=True)
     )

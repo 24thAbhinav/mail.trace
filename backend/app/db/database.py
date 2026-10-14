@@ -27,6 +27,12 @@ def create_db_and_tables() -> None:
 
     SQLModel.metadata.create_all(engine)
 
+    # Reconcile any pre-existing tables (e.g. ``emails`` from before the
+    # processing-status column existed). Idempotent; no-op on SQLite.
+    from app.db.migrations import apply_migrations
+
+    apply_migrations(engine)
+
 
 def get_session() -> Generator[Session, None, None]:
     """FastAPI dependency that yields a database session."""
