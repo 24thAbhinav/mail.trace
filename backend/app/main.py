@@ -10,10 +10,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
-from sqlmodel import Session
+from sqlmodel import Session, select
 
+from app.api.applications import router as applications_router
 from app.db import database
 from app.db.database import create_db_and_tables, get_session
+from app.db.models import Email
 from app.gmail.oauth import (
     CODE_VERIFIER_COOKIE,
     STATE_COOKIE,
@@ -41,6 +43,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Job Tracker", lifespan=lifespan)
+
+app.include_router(applications_router)
 
 
 def get_settings() -> GmailAuthSettings:
@@ -148,6 +152,35 @@ def start_gmail_watch(
         return register_watch(settings, session)
     except GmailAuthError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/gmail/sync", tags=["gmail"])
+def trigger_full_sync(
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+    service=Depends(get_gmail_service),
+):
+    """Full mailbox resync.
+
+    Persists any unseen messages as ``PENDING`` and returns ``{"fetched", "processed"}``
+    where ``fetched`` is the number of messages listed and ``processed`` is the list
+    of message ids that were newly persisted. Newly synced emails are classified by
+    a background task so this request is not blocked by LLM processing.
+    """
+    profile = service.users().getProfile(userId="me").execute()
+    email_address = profile["emailAddress"]
+
+    before = set(session.exec(select(Email.message_id)).all())
+    try:
+        listed = full_sync(service, session, email_address)
+    except Exception:
+        session.rollback()
+        return JSONResponse(status_code=500, content={"detail": "Gmail sync failed"})
+
+    background_tasks.add_task(_drain_pending_emails)
+
+    new_ids = [message_id for message_id in listed if message_id not in before]
+    return {"fetched": len(listed), "processed": new_ids}
 
 
 @app.post("/pubsub/push")

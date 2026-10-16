@@ -173,3 +173,35 @@ def test_drain_pending_emails_uses_own_session(
     assert kwargs["limit"] == 7
     assert isinstance(session, Session)
     assert session.get_bind() is engine
+
+
+def test_gmail_sync_returns_counts_and_schedules_processing(
+    client, fake_gmail, no_llm_processing
+):
+    fake_gmail.list_pages = [{"messages": [{"id": "m1"}, {"id": "m2"}]}]
+    fake_gmail.messages = {
+        "m1": make_message("m1", subject="one"),
+        "m2": make_message("m2", subject="two"),
+    }
+
+    response = client.post("/gmail/sync")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["fetched"] == 2
+    assert set(data["processed"]) == {"m1", "m2"}
+    assert len(no_llm_processing) == 1
+
+
+def test_gmail_sync_second_run_reports_no_new_emails(
+    client, fake_gmail, no_llm_processing
+):
+    fake_gmail.list_pages = [{"messages": [{"id": "m1"}]}]
+    fake_gmail.messages = {"m1": make_message("m1", subject="one")}
+
+    assert client.post("/gmail/sync").json()["processed"] == ["m1"]
+
+    # Re-listing the same message must not report it as newly persisted.
+    fake_gmail.list_pages = [{"messages": [{"id": "m1"}]}]
+    second = client.post("/gmail/sync").json()
+    assert second["fetched"] == 1
+    assert second["processed"] == []

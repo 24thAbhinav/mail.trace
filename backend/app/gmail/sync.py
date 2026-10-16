@@ -309,13 +309,15 @@ def sync_history(
     session.commit()
 
 
-def full_sync(service, session: Session, email_address: str) -> None:
+def full_sync(service, session: Session, email_address: str) -> list[str]:
     """Safe resynchronization after a history cursor has expired.
 
     Re-reads the entire mailbox (deduped by message id, so no email is lost) and
     re-anchors the cursor to the mailbox's current history id. The cursor is
     read *before* listing so anything arriving mid-scan is recovered by the
     next incremental sync (never missed, only possibly re-fetched).
+
+    Returns the message ids listed (whether or not they were newly persisted).
     """
     _lock_cursor(session, email_address)  # serialize with concurrent sync_history
 
@@ -345,6 +347,7 @@ def full_sync(service, session: Session, email_address: str) -> None:
         set_cursor(session, email_address, str(history_id))
 
     session.commit()
+    return message_ids
 
 
 def _fetch_and_persist(service, session: Session, message_id: str) -> None:
