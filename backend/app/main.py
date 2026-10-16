@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import secrets
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from sqlmodel import Session
 
+from app.db import database
 from app.db.database import create_db_and_tables, get_session
 from app.gmail.oauth import (
     CODE_VERIFIER_COOKIE,
@@ -29,6 +31,7 @@ from app.gmail.sync import (
     full_sync,
     sync_history,
 )
+from app.services.email_processor import process_pending_emails
 
 
 @asynccontextmanager
@@ -50,6 +53,27 @@ def get_settings() -> GmailAuthSettings:
 def get_gmail_service(settings: GmailAuthSettings = Depends(get_settings)):
     """FastAPI dependency that yields an authenticated Gmail API client."""
     return build_service(settings)
+
+
+logger = logging.getLogger(__name__)
+
+# Upper bound on emails drained per background run, so one run stays bounded.
+PROCESS_BATCH_LIMIT = 25
+
+
+def _drain_pending_emails(limit: int = PROCESS_BATCH_LIMIT) -> None:
+    """Process pending raw emails in a fresh, self-closing session.
+
+    Scheduled as a FastAPI background task so the Pub/Sub HTTP response is not
+    blocked by (potentially slow) LLM processing. The request-scoped session is
+    already closed by the time this runs, so it opens and closes its own
+    ``Session`` on the project's engine.
+    """
+    try:
+        with Session(database.engine) as session:
+            process_pending_emails(session, limit=limit)
+    except Exception:
+        logger.exception("Background email processing failed")
 
 
 @app.get("/auth/google", tags=["auth"])
@@ -129,6 +153,7 @@ def start_gmail_watch(
 @app.post("/pubsub/push")
 async def pubsub_push(
     request: Request,
+    background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
     service=Depends(get_gmail_service),
 ):
@@ -169,4 +194,25 @@ async def pubsub_push(
         session.rollback()
         return JSONResponse(status_code=500, content={"detail": "Gmail sync failed"})
 
+    # Sync succeeded (incremental, or full-sync recovery above). Drain the newly
+    # synced emails in the background so the HTTP response is not blocked by
+    # LLM processing. The task opens its own session.
+    background_tasks.add_task(_drain_pending_emails)
+
     return {"status": "ok"}
+
+
+@app.post("/emails/process", tags=["emails"])
+def trigger_email_processing(
+    limit: int = 10,
+    retry_failed: bool = False,
+    message_id: str | None = None,
+    session: Session = Depends(get_session),
+):
+    """Trigger processing of pending (or failed) raw emails through the LangGraph pipeline."""
+    return process_pending_emails(
+        session,
+        limit=limit,
+        retry_failed=retry_failed,
+        message_id=message_id,
+    )

@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
 import app.db.database as db
+import app.main as main
 from app.db.models import Email
 from app.gmail.sync import get_cursor, set_cursor
 from app.main import app, get_gmail_service
@@ -34,6 +35,23 @@ def client(engine, fake_gmail, monkeypatch):
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
+
+
+@pytest.fixture(autouse=True)
+def no_llm_processing(monkeypatch):
+    """Stub the processing entrypoint so tests never invoke the real LLM.
+
+    Records each call's ``(session, kwargs)`` so tests can assert whether the
+    Pub/Sub background drain ran, and that it opened its own session.
+    """
+    calls: list[tuple[Session, dict]] = []
+
+    def spy(session, **kwargs):
+        calls.append((session, kwargs))
+        return {"claimed": 0, "processed": 0, "skipped": 0, "failed": 0}
+
+    monkeypatch.setattr(main, "process_pending_emails", spy)
+    return calls
 
 
 def test_pubsub_push_ok(client):
@@ -106,3 +124,52 @@ def test_pubsub_push_expired_history_triggers_full_sync(client, fake_gmail, engi
         emails = s.exec(select(Email)).all()
         assert {e.message_id for e in emails} == {"m1"}
         assert get_cursor(s, "a@example.com") == "500"
+
+
+def test_pubsub_push_schedules_processing(client, no_llm_processing):
+    response = client.post("/pubsub/push", json=_payload())
+    assert response.status_code == 200
+    assert len(no_llm_processing) == 1
+
+
+def test_pubsub_push_full_sync_recovery_schedules_processing(
+    client, fake_gmail, no_llm_processing
+):
+    fake_gmail.history_error = make_404()
+    fake_gmail.list_pages = [{"messages": []}]
+
+    response = client.post("/pubsub/push", json=_payload())
+    assert response.status_code == 200
+    assert len(no_llm_processing) == 1
+
+
+def test_pubsub_push_sync_failure_does_not_schedule_processing(
+    client, fake_gmail, no_llm_processing
+):
+    fake_gmail.history_error = Exception("transient failure")
+
+    response = client.post("/pubsub/push", json=_payload())
+    assert response.status_code == 500
+    assert no_llm_processing == []
+
+
+def test_pubsub_push_invalid_payload_does_not_schedule_processing(
+    client, no_llm_processing
+):
+    response = client.post("/pubsub/push", json={"message": {"data": "!!bad!!"}})
+    assert response.status_code == 400
+    assert no_llm_processing == []
+
+
+def test_drain_pending_emails_uses_own_session(
+    engine, monkeypatch, no_llm_processing
+):
+    monkeypatch.setattr(db, "engine", engine)
+
+    main._drain_pending_emails(limit=7)
+
+    assert len(no_llm_processing) == 1
+    session, kwargs = no_llm_processing[0]
+    assert kwargs["limit"] == 7
+    assert isinstance(session, Session)
+    assert session.get_bind() is engine
