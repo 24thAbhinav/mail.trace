@@ -97,22 +97,22 @@ sequenceDiagram
     SYNC->>DB: _lock_cursor() SELECT ... FOR UPDATE
     SYNC->>G: history.list(startHistoryId, pageToken)
     loop each message_id
-        SYNC->>DB: _email_exists? ; session.add(Email(status=PENDING))
+        SYNC->>DB: skip if _email_exists, else session.add Email as PENDING
     end
-    SYNC->>DB: set_cursor(historyId); commit
+    SYNC->>DB: set_cursor(historyId), then commit
     alt Gmail 404 (cursor expired)
         API->>SYNC: full_sync(...)
-        SYNC->>DB: re-list all, re-persist, re-anchor cursor; commit
+        SYNC->>DB: re-list all, re-persist, re-anchor cursor, then commit
     end
     API->>BG: background_tasks.add_task(_drain_pending_emails)
-    API-->>G: 200 {"status":"ok"}   %% sent BEFORE processing starts
+    API-->>G: 200 {"status":"ok"} (before background work)
     end
 
     rect rgb(245,240,255)
     Note over BG,LLM: BACKGROUND (slow, non-blocking)
     BG->>DB: with Session(engine) as session
     BG->>PROC: process_pending_emails(session, limit=25)
-    PROC->>DB: claim_pending_emails(): PENDING -> PROCESSING; commit
+    PROC->>DB: claim_pending_emails(): PENDING to PROCESSING, then commit
     loop each claimed email
         PROC->>LLM: graph.invoke(email_to_state(email))
         LLM-->>PROC: is_application_email, company, role, status, ...
@@ -121,7 +121,7 @@ sequenceDiagram
         else irrelevant
             PROC->>DB: ProcessedEmail("skipped")
         end
-        PROC->>DB: Email.status = COMPLETED; commit
+        PROC->>DB: Email.status = COMPLETED, then commit
     end
     Note over PROC: on error -> Email.status = FAILED (via _record_processing_failure)
     end
