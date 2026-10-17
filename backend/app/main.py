@@ -1,42 +1,39 @@
-# main.py - FastAPI application entry point + Gmail webhook/auth + Static SPA
+"""FastAPI application entry point (minimal: DB init + Gmail OAuth)."""
 
 from __future__ import annotations
 
-import os
+import base64
+import json
+import logging
+import secrets
 from contextlib import asynccontextmanager
-from pathlib import Path
 
-from dotenv import load_dotenv
-
-load_dotenv(override=True)
-if os.getenv("LANGSMITH_API_KEY") and not os.getenv("LANGCHAIN_API_KEY"):
-    os.environ["LANGCHAIN_API_KEY"] = os.environ["LANGSMITH_API_KEY"]
-if os.getenv("LANGSMITH_TRACING") == "true":
-    os.environ["LANGCHAIN_TRACING_V2"] = "true"
-if os.getenv("LANGSMITH_PROJECT"):
-    os.environ.setdefault("LANGCHAIN_PROJECT", os.environ["LANGSMITH_PROJECT"])
-
-from fastapi import APIRouter, Depends, FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
-from sqlmodel import Session
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, RedirectResponse
+from sqlmodel import Session, select
 
 from app.api.applications import router as applications_router
+from app.db import database
 from app.db.database import create_db_and_tables, get_session
-from app.db.repository import ApplicationRepository
-from app.gmail import (
-    GmailClient,
-    GmailError,
-    GmailSettings,
-    GmailSync,
+from app.db.models import Email
+from app.gmail.oauth import (
+    CODE_VERIFIER_COOKIE,
+    STATE_COOKIE,
+    STATE_MAX_AGE,
+    GmailAuthError,
+    GmailAuthSettings,
     authorization_url,
-    decode_push,
     exchange_code,
-    get_credentials,
+    generate_state,
 )
-from app.graph.graph import workflow
-from app.services.email_processor import process_email
+from app.gmail.service import build_service, register_watch
+from app.gmail.sync import (
+    GmailSyncError,
+    HistoryExpiredError,
+    full_sync,
+    sync_history,
+)
+from app.services.email_processor import process_pending_emails
 
 
 @asynccontextmanager
@@ -47,164 +44,208 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Job Tracker", lifespan=lifespan)
 
-_origins = os.getenv("FRONTEND_ORIGINS", "http://localhost:5173,http://localhost:3000")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[origin.strip() for origin in _origins.split(",") if origin.strip()],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-def get_settings() -> GmailSettings:
-    return GmailSettings.from_env()
-
-
-def get_workflow():
-    return workflow
-
-
-def get_gmail_sync(
-    session: Session = Depends(get_session),
-    settings: GmailSettings = Depends(get_settings),
-) -> GmailSync:
-    client = GmailClient.from_credentials(get_credentials(settings))
-    return GmailSync(
-        client,
-        session,
-        topic=settings.topic,
-        account=settings.account,
-        full_sync_max=settings.full_sync_max,
-    )
-
-
-def _process_emails(sync: GmailSync, graph, emails) -> list[dict]:
-    repo = ApplicationRepository(sync.session)
-    processed: list[dict] = []
-    for email in emails:
-        # Same Gmail message must not be processed twice: existing source_email_id
-        # is the idempotency key.
-        if repo.get_application_by_email_id(email.id) is not None:
-            continue
-        state = process_email(email, graph=graph)
-        processed.append(
-            {
-                "email_id": email.id,
-                "is_application_email": state.get("is_application_email"),
-                "application_id": state.get("application_id"),
-            }
-        )
-    return processed
-
-
-# ── Routers ─────────────────────────────────────────────────────────────────
-
-auth_router = APIRouter(prefix="/auth", tags=["auth"])
-gmail_router = APIRouter(prefix="/gmail", tags=["gmail"])
-
-
-# ── One-time OAuth ──────────────────────────────────────────────────────────
-
-
-@auth_router.get("/url")
-def gmail_auth_url(settings: GmailSettings = Depends(get_settings)):
-    """Open this in a browser to start the Google consent flow."""
-    try:
-        url, _state = authorization_url(settings)
-    except GmailError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return RedirectResponse(url)
-
-
-@auth_router.get("/callback")
-def gmail_auth_callback(
-    code: str | None = None,
-    settings: GmailSettings = Depends(get_settings),
-):
-    """Google redirects here; exchanges the code and stores token.json."""
-    if not code:
-        raise HTTPException(status_code=400, detail="Missing ?code from Google")
-    try:
-        exchange_code(settings, code)
-    except GmailError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"status": "authorized", "token_path": settings.token_path}
-
-
-# ── Gmail watch + ingestion ─────────────────────────────────────────────────
-
-
-@gmail_router.post("/watch")
-def gmail_watch(sync: GmailSync = Depends(get_gmail_sync)) -> dict:
-    """Start/renew the Gmail push watch."""
-    try:
-        return sync.start_watch()
-    except GmailError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@gmail_router.post("/sync")
-def gmail_manual_sync(
-    sync: GmailSync = Depends(get_gmail_sync),
-    graph=Depends(get_workflow),
-) -> dict:
-    """Manually pull recent messages (useful for local testing without Pub/Sub)."""
-    emails = sync.full_sync()
-    return {"fetched": len(emails), "processed": _process_emails(sync, graph, emails)}
-
-
-@gmail_router.post("/webhook")
-def gmail_webhook(
-    envelope: dict,
-    sync: GmailSync = Depends(get_gmail_sync),
-    graph=Depends(get_workflow),
-) -> dict:
-    """Receive a Pub/Sub push, sync Gmail history, process each new email."""
-    try:
-        notification = decode_push(envelope)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    emails = sync.process_history(notification["history_id"])
-
-    # Gmail watches expire every 7 days. Auto-renew whenever we're within
-    # 1 hour of expiry so pushes never silently stop arriving.
-    if sync.watch_needs_renewal():
-        try:
-            sync.renew_watch()
-        except GmailError:
-            pass  # don't fail the webhook if renewal fails; it'll retry next time
-
-    return {"processed": _process_emails(sync, graph, emails)}
-
-
-# Register API routes (both direct and with /api prefix for frontend/backend flexibility)
 app.include_router(applications_router)
-app.include_router(applications_router, prefix="/api")
-app.include_router(auth_router)
-app.include_router(auth_router, prefix="/api")
-app.include_router(gmail_router)
-app.include_router(gmail_router, prefix="/api")
 
 
-# ── Static React SPA Serving ───────────────────────────────────────────────
+def get_settings() -> GmailAuthSettings:
+    try:
+        return GmailAuthSettings.from_env()
+    except GmailAuthError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-_frontend_dist = Path("/app/frontend/dist")
-if not _frontend_dist.exists():
-    _frontend_dist = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 
-if _frontend_dist.exists():
-    _assets = _frontend_dist / "assets"
-    if _assets.exists():
-        app.mount("/assets", StaticFiles(directory=str(_assets)), name="assets")
+def get_gmail_service(settings: GmailAuthSettings = Depends(get_settings)):
+    """FastAPI dependency that yields an authenticated Gmail API client."""
+    return build_service(settings)
 
-    @app.get("/{full_path:path}")
-    async def serve_spa(full_path: str):
-        # Don't serve index.html for API paths that 404
-        if full_path.startswith(("api/", "auth/", "gmail/", "applications/")):
-            raise HTTPException(status_code=404, detail="Not Found")
-        file_path = _frontend_dist / full_path
-        if full_path and file_path.is_file():
-            return FileResponse(file_path)
-        return FileResponse(_frontend_dist / "index.html")
+
+logger = logging.getLogger(__name__)
+
+# Upper bound on emails drained per background run, so one run stays bounded.
+PROCESS_BATCH_LIMIT = 25
+
+
+def _drain_pending_emails(limit: int = PROCESS_BATCH_LIMIT) -> None:
+    """Process pending raw emails in a fresh, self-closing session.
+
+    Scheduled as a FastAPI background task so the Pub/Sub HTTP response is not
+    blocked by (potentially slow) LLM processing. The request-scoped session is
+    already closed by the time this runs, so it opens and closes its own
+    ``Session`` on the project's engine.
+    """
+    try:
+        with Session(database.engine) as session:
+            process_pending_emails(session, limit=limit)
+    except Exception:
+        logger.exception("Background email processing failed")
+
+
+@app.get("/auth/google", tags=["auth"])
+def google_oauth_start(
+    request: Request,
+    settings: GmailAuthSettings = Depends(get_settings),
+):
+    """Redirect to Google's OAuth consent screen."""
+    state = generate_state()
+    url, code_verifier = authorization_url(settings, state)
+    response = RedirectResponse(url)
+    response.set_cookie(
+        STATE_COOKIE,
+        state,
+        max_age=STATE_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+    )
+    response.set_cookie(
+        CODE_VERIFIER_COOKIE,
+        code_verifier,
+        max_age=STATE_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+    )
+    return response
+
+
+@app.get("/auth/google/callback", tags=["auth"])
+def google_oauth_callback(
+    request: Request,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    settings: GmailAuthSettings = Depends(get_settings),
+):
+    """Validate OAuth state, exchange the code, and store the token."""
+    if error:
+        raise HTTPException(status_code=400, detail=f"Google OAuth error: {error}")
+
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing 'code' parameter.")
+
+    expected_state = request.cookies.get(STATE_COOKIE)
+    if (
+        not state
+        or not expected_state
+        or not secrets.compare_digest(state, expected_state)
+    ):
+        raise HTTPException(
+            status_code=400, detail="Invalid or missing 'state' parameter."
+        )
+
+    code_verifier = request.cookies.get(CODE_VERIFIER_COOKIE)
+    try:
+        exchange_code(settings, code, code_verifier)
+    except GmailAuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    response = JSONResponse({"status": "authorized"})
+    response.delete_cookie(STATE_COOKIE)
+    response.delete_cookie(CODE_VERIFIER_COOKIE)
+    return response
+
+
+@app.post("/gmail/watch")
+def start_gmail_watch(
+    settings: GmailAuthSettings = Depends(get_settings),
+    session: Session = Depends(get_session),
+):
+    try:
+        return register_watch(settings, session)
+    except GmailAuthError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/gmail/sync", tags=["gmail"])
+def trigger_full_sync(
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+    service=Depends(get_gmail_service),
+):
+    """Full mailbox resync.
+
+    Persists any unseen messages as ``PENDING`` and returns ``{"fetched", "processed"}``
+    where ``fetched`` is the number of messages listed and ``processed`` is the list
+    of message ids that were newly persisted. Newly synced emails are classified by
+    a background task so this request is not blocked by LLM processing.
+    """
+    profile = service.users().getProfile(userId="me").execute()
+    email_address = profile["emailAddress"]
+
+    before = set(session.exec(select(Email.message_id)).all())
+    try:
+        listed = full_sync(service, session, email_address)
+    except Exception:
+        session.rollback()
+        return JSONResponse(status_code=500, content={"detail": "Gmail sync failed"})
+
+    background_tasks.add_task(_drain_pending_emails)
+
+    new_ids = [message_id for message_id in listed if message_id not in before]
+    return {"fetched": len(listed), "processed": new_ids}
+
+
+@app.post("/pubsub/push")
+async def pubsub_push(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+    service=Depends(get_gmail_service),
+):
+    try:
+        body = await request.json()
+        data = body["message"]["data"]
+        notification = json.loads(base64.b64decode(data).decode("utf-8"))
+        email_address = notification["emailAddress"]
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Invalid Pub/Sub payload"},
+        )
+
+    try:
+        # The stored cursor is the authoritative startHistoryId; the
+        # notification's historyId is only a fallback for a fresh mailbox.
+        sync_history(
+            service,
+            session,
+            email_address,
+            fallback_history_id=notification.get("historyId"),
+        )
+    except HistoryExpiredError:
+        # Cursor is too old for incremental sync: recover with a full resync.
+        try:
+            full_sync(service, session, email_address)
+        except Exception:
+            session.rollback()
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Gmail resynchronization failed"},
+            )
+    except GmailSyncError as exc:
+        session.rollback()
+        return JSONResponse(status_code=500, content={"detail": str(exc)})
+    except Exception:
+        session.rollback()
+        return JSONResponse(status_code=500, content={"detail": "Gmail sync failed"})
+
+    # Sync succeeded (incremental, or full-sync recovery above). Drain the newly
+    # synced emails in the background so the HTTP response is not blocked by
+    # LLM processing. The task opens its own session.
+    background_tasks.add_task(_drain_pending_emails)
+
+    return {"status": "ok"}
+
+
+@app.post("/emails/process", tags=["emails"])
+def trigger_email_processing(
+    limit: int = 10,
+    retry_failed: bool = False,
+    message_id: str | None = None,
+    session: Session = Depends(get_session),
+):
+    """Trigger processing of pending (or failed) raw emails through the LangGraph pipeline."""
+    return process_pending_emails(
+        session,
+        limit=limit,
+        retry_failed=retry_failed,
+        message_id=message_id,
+    )

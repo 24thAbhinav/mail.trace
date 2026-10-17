@@ -72,9 +72,9 @@ export default api
 
 // Gmail & auth endpoints
 export async function getAuthUrl(): Promise<string> {
-  // /api/auth/url does a 307 redirect — return the redirect target URL
-  // We open it directly in the browser, so just build the URL
-  return `${api.defaults.baseURL}/auth/url`
+  // /auth/google does a 307 redirect to Google — return that URL and let
+  // the browser follow it directly.
+  return '/auth/google'
 }
 
 export async function registerWatch(): Promise<{ history_id: string | null; expiration: string | null }> {

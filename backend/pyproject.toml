@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "job-tracker-backend"
+name = "mail-trace-backend"
 version = "0.1.0"
 description = "AI agent that reads Gmail and tracks job applications"
 authors = ["Your Name <you@example.com>"]
@@ -58,3 +58,14 @@ select = ["E", "F", "I"]
 [tool.mypy]
 python_version = "3.11"
 ignore_missing_imports = true
+
+[tool.basedpyright]
+reportMissingTypeStubs = "none"
+# LangChain/LangGraph ship loosely-typed stubs (heavy `Any`/`Unknown`), so the
+# "unknown" family is noise here. Their builder methods (add_node/add_edge/...)
+# return `self` for chaining, so discarding those results is intentional.
+reportUnknownMemberType = "none"
+reportUnknownVariableType = "none"
+reportUnknownArgumentType = "none"
+reportUnknownParameterType = "none"
+reportUnusedCallResult = "none"

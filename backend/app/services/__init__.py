@@ -1,1 +1,1 @@
-# services - integration boundaries between layers
+"""Business logic and processing services for mail.trace."""

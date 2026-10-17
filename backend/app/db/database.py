@@ -1,4 +1,4 @@
-# database.py - DB engine, SessionLocal, Base
+"""Database engine, table creation, and session dependency."""
 
 from __future__ import annotations
 
@@ -11,29 +11,27 @@ from sqlmodel import Session, SQLModel, create_engine
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./job_tracker.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 # SQLAlchemy 2.0 requires postgresql:// instead of postgres://
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-_connect_args = (
-    {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-)
-
-engine = create_engine(DATABASE_URL, echo=False, connect_args=_connect_args)
+engine = create_engine(DATABASE_URL, echo=False)
 
 
 def create_db_and_tables() -> None:
-    """Create all tables registered on SQLModel metadata."""
-    if DATABASE_URL.startswith("sqlite:///"):
-        db_raw = DATABASE_URL.replace("sqlite:////", "/").replace("sqlite:///", "")
-        if "/" in db_raw:
-            Path(db_raw).parent.mkdir(parents=True, exist_ok=True)
+    """Create all tables registered on SQLModel metadata (idempotent)."""
     # Import models so they are registered on SQLModel.metadata before create_all.
     from app.db import models  # noqa: F401
 
     SQLModel.metadata.create_all(engine)
+
+    # Reconcile any pre-existing tables (e.g. ``emails`` from before the
+    # processing-status column existed). Idempotent; no-op on SQLite.
+    from app.db.migrations import apply_migrations
+
+    apply_migrations(engine)
 
 
 def get_session() -> Generator[Session, None, None]:

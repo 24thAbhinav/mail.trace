@@ -1,1 +1,1 @@
-# api - HTTP layer (read-only dashboard endpoints)
+"""API routers for mail.trace."""

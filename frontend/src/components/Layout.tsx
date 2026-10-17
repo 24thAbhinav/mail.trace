@@ -11,9 +11,9 @@ export default function Layout() {
       <aside className="sidebar">
         <div className="sidebar-top">
           <span className="brand-mark" aria-hidden>
-            JT
+            MT
           </span>
-          <span className="brand-name">Job Tracker</span>
+          <span className="brand-name">mail.trace</span>
         </div>
         <nav className="side-nav" aria-label="Primary">
           <NavLink to="/" end className={navClass}>

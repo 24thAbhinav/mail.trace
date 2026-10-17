@@ -1,4 +1,4 @@
-# Brand — Job Tracker
+# Brand — mail.trace
 
 _Status: active_
 
