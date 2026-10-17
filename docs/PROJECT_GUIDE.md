@@ -392,9 +392,9 @@ stateDiagram-v2
     PROCESSING --> COMPLETED: _process_single_email_tx (processed or skipped)
     PROCESSING --> FAILED: _record_processing_failure
     FAILED --> PROCESSING: claim_pending_emails(include_failed=True)
-    COMPLETED --> PROCESSING: claim_email_by_message_id (re-claim; then idempotency short-circuits)
+    COMPLETED --> PROCESSING: claim_email_by_message_id (re-claim, then idempotency short-circuits)
     note right of PROCESSING
-        No PROCESSING -> PENDING edge exists.
+        No PROCESSING to PENDING edge exists.
         A crash here strands the row (no stale recovery).
     end note
 ```
