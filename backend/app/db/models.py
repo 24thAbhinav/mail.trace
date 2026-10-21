@@ -1,12 +1,13 @@
 """SQLModel ORM models for the mail.trace schema.
 
-Five tables:
+Six tables:
 
 * ``applications``       -- one row per job opportunity (the "first entry")
 * ``application_events`` -- the "updates" table (one row per follow-up email)
 * ``processed_emails``   -- ingestion dedup / audit log
 * ``sync_state``         -- per-mailbox Gmail history cursor for incremental sync
 * ``emails``             -- raw synced emails (deduped by Gmail message id)
+* ``gmail_tokens``       -- persisted OAuth credentials (survives restarts)
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 
-from sqlalchemy import DateTime
+from sqlalchemy import DateTime, Text
 from sqlmodel import Field, SQLModel
 
 
@@ -180,6 +181,32 @@ class Email(SQLModel, table=True):
 
     status: EmailStatus = Field(default=EmailStatus.PENDING, index=True)
     error: str | None = None
+    updated_at: datetime = Field(
+        default_factory=utcnow, sa_type=DateTime(timezone=True)
+    )
+
+
+class GmailToken(SQLModel, table=True):
+    """Persisted Google OAuth credentials, one row per Gmail account.
+
+    Storing the token JSON in Postgres means it survives server restarts
+    (important for ephemeral platforms like Render's free tier). The
+    ``credentials_json`` column holds the raw JSON string returned by
+    ``Credentials.to_json()`` so the full token — including the refresh
+    token — is preserved intact.
+    """
+
+    __tablename__ = "gmail_tokens"
+
+    id: int | None = Field(default=None, primary_key=True)
+
+    # The Gmail address this token belongs to (e.g. "user@gmail.com").
+    # Unique so each account has exactly one active row.
+    email_address: str = Field(unique=True, index=True)
+
+    # Full JSON blob from google.oauth2.credentials.Credentials.to_json().
+    credentials_json: str = Field(sa_type=Text)
+
     updated_at: datetime = Field(
         default_factory=utcnow, sa_type=DateTime(timezone=True)
     )

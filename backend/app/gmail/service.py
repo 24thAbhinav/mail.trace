@@ -7,9 +7,9 @@ from app.gmail.oauth import GmailAuthSettings, get_credentials
 from app.gmail.sync import ensure_cursor
 
 
-def build_service(settings: GmailAuthSettings):
+def build_service(settings: GmailAuthSettings, session: Session | None = None):
     """Build an authenticated Gmail API client."""
-    credentials = get_credentials(settings)
+    credentials = get_credentials(settings, session=session)
     return build("gmail", "v1", credentials=credentials)
 
 
@@ -19,7 +19,7 @@ def register_watch(settings: GmailAuthSettings, session: Session) -> dict:
     The initial ``historyId`` is stored only when no cursor exists for the
     mailbox yet; renewals never overwrite an existing cursor.
     """
-    service = build_service(settings)
+    service = build_service(settings, session=session)
 
     watch_resp = (
         service.users()

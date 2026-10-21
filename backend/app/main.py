@@ -70,9 +70,12 @@ def get_settings() -> GmailAuthSettings:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-def get_gmail_service(settings: GmailAuthSettings = Depends(get_settings)):
+def get_gmail_service(
+    settings: GmailAuthSettings = Depends(get_settings),
+    session: Session = Depends(get_session),
+):
     """FastAPI dependency that yields an authenticated Gmail API client."""
-    return build_service(settings)
+    return build_service(settings, session=session)
 
 
 logger = logging.getLogger(__name__)
@@ -129,8 +132,9 @@ def google_oauth_callback(
     state: str | None = None,
     error: str | None = None,
     settings: GmailAuthSettings = Depends(get_settings),
+    session: Session = Depends(get_session),
 ):
-    """Validate OAuth state, exchange the code, and store the token."""
+    """Validate OAuth state, exchange the code, and store the token in DB."""
     if error:
         raise HTTPException(status_code=400, detail=f"Google OAuth error: {error}")
 
@@ -149,7 +153,7 @@ def google_oauth_callback(
 
     code_verifier = request.cookies.get(CODE_VERIFIER_COOKIE)
     try:
-        exchange_code(settings, code, code_verifier)
+        exchange_code(settings, code, code_verifier, session=session)
     except GmailAuthError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

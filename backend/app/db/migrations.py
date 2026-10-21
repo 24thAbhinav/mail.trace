@@ -82,3 +82,26 @@ def apply_migrations(engine: Engine, schema: str | None = None) -> None:
             conn.execute(
                 text(f"CREATE INDEX ix_emails_status ON {table_ref} (status)")
             )
+
+    # ── gmail_tokens ─────────────────────────────────────────────────────────
+    # Create the table if it was not caught by create_all (i.e. on an existing
+    # deployment that pre-dates this model).
+    if "gmail_tokens" not in inspector.get_table_names(schema=schema):
+        qualified_gt = f'{qualified}"gmail_tokens"'
+        conn.execute(
+            text(
+                f"CREATE TABLE {qualified_gt} ("
+                "id SERIAL PRIMARY KEY, "
+                "email_address VARCHAR NOT NULL UNIQUE, "
+                "credentials_json TEXT NOT NULL, "
+                "updated_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+                ")"
+            )
+        )
+        conn.execute(
+            text(
+                f"CREATE UNIQUE INDEX ix_gmail_tokens_email_address "
+                f"ON {qualified_gt} (email_address)"
+            )
+        )
+
