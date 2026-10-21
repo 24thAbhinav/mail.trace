@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: mail-trace-backend
+    runtime: python
+    region: oregon
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /docs
+    envVars:
+      # ── Database ───────────────────────────────────────────────────────────
+      - key: DATABASE_URL
+        sync: false
+
+      # ── Google OAuth ───────────────────────────────────────────────────────
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        sync: false
+
+      # ── Gmail Pub/Sub ──────────────────────────────────────────────────────
+      - key: GMAIL_TOKEN_PATH
+        value: /tmp/token.json
+      - key: GMAIL_PUBSUB_TOPIC
+        sync: false
+
+      # ── OpenCode / LLM ─────────────────────────────────────────────────────
+      - key: OPENCODE_API_KEY
+        sync: false
+
+      # ── LangSmith (optional) ───────────────────────────────────────────────
+      - key: LANGSMITH_TRACING
+        value: "true"
+      - key: LANGSMITH_API_KEY
+        sync: false
+      - key: LANGSMITH_ENDPOINT
+        value: https://api.smith.langchain.com
+      - key: LANGSMITH_PROJECT
+        value: mailtrace
+
+      # ── CORS ───────────────────────────────────────────────────────────────
+      - key: ALLOWED_ORIGINS
+        sync: false

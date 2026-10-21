@@ -5,10 +5,12 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import secrets
 from contextlib import asynccontextmanager
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from sqlmodel import Session, select
 
@@ -43,6 +45,20 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Job Tracker", lifespan=lifespan)
+
+# ── CORS ────────────────────────────────────────────────────────────────────
+# In production, set ALLOWED_ORIGINS to your Vercel frontend URL(s), e.g.:
+#   ALLOWED_ORIGINS=https://mail-trace.vercel.app,https://mailtrace.your-domain.com
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000")
+_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(applications_router)
 
@@ -157,22 +173,29 @@ def start_gmail_watch(
 @app.post("/gmail/sync", tags=["gmail"])
 def trigger_full_sync(
     background_tasks: BackgroundTasks,
+    max_messages: int = 100,
     session: Session = Depends(get_session),
     service=Depends(get_gmail_service),
 ):
-    """Full mailbox resync.
+    """Bounded mailbox resync.
 
-    Persists any unseen messages as ``PENDING`` and returns ``{"fetched", "processed"}``
-    where ``fetched`` is the number of messages listed and ``processed`` is the list
-    of message ids that were newly persisted. Newly synced emails are classified by
-    a background task so this request is not blocked by LLM processing.
+    Pulls up to ``max_messages`` of the newest messages (default 100, capped at
+    500) so a manual sync never walks an entire large mailbox. Persists any
+    unseen messages as ``PENDING`` and returns ``{"fetched", "processed"}`` where
+    ``fetched`` is the number of messages listed and ``processed`` is the list of
+    message ids newly persisted. Newly synced emails are classified by a
+    background task so this request is not blocked by LLM processing.
     """
+    max_messages = max(1, min(max_messages, 500))
+
     profile = service.users().getProfile(userId="me").execute()
     email_address = profile["emailAddress"]
 
     before = set(session.exec(select(Email.message_id)).all())
     try:
-        listed = full_sync(service, session, email_address)
+        listed = full_sync(
+            service, session, email_address, max_messages=max_messages
+        )
     except Exception:
         session.rollback()
         return JSONResponse(status_code=500, content={"detail": "Gmail sync failed"})
