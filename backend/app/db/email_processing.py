@@ -1,9 +1,8 @@
-# email_processing.py - minimal status-transition helpers for raw emails.
+# email_processing.py - status-transition helpers for the raw ``emails`` table.
 #
-# These are the building blocks a future async worker will use to drain the
-# ``emails`` table (no queue service is wired up yet). Gmail sync writes rows as
-# ``PENDING``; these functions move them through ``PROCESSING`` -> ``COMPLETED``
-# / ``FAILED``.
+# Gmail sync writes rows as ``PENDING``; app/services/email_processor.py claims
+# them (``PENDING`` -> ``PROCESSING``) and marks them ``COMPLETED`` / ``FAILED``
+# as it drains them.
 
 from __future__ import annotations
 
@@ -59,21 +58,4 @@ def claim_email_by_message_id(
         email.status = EmailStatus.PROCESSING
         email.updated_at = utcnow()
         session.commit()
-    return email
-
-
-def mark_email_status(
-    session: Session,
-    email: Email,
-    status: EmailStatus,
-    *,
-    error: str | None = None,
-) -> Email:
-    """Transition an email to a terminal (or failed) status."""
-    email.status = status
-    email.error = error
-    email.updated_at = utcnow()
-    session.add(email)
-    session.commit()
-    session.refresh(email)
     return email

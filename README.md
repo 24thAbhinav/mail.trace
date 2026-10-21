@@ -306,9 +306,18 @@ GOOGLE_CLIENT_SECRET=        # OAuth client secret (required)
 GOOGLE_REDIRECT_URI=http://localhost:8000/auth/google/callback
 GMAIL_PUBSUB_TOPIC=projects/<project>/topics/<topic>   # required for /gmail/watch
 GMAIL_TOKEN_PATH=token.json  # optional; defaults to backend/token.json
+LANGSMITH_TRACING=true       # optional: trace each processed email
+LANGSMITH_API_KEY=           # optional: LangSmith API key
+LANGSMITH_PROJECT=mailtrace  # optional: LangSmith project name
 ```
 
 The Google Cloud OAuth client must whitelist `GOOGLE_REDIRECT_URI` as an authorized redirect URI.
+
+**Observability.** With `LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY` set, every processed
+email is recorded in LangSmith as **one trace** — the pipeline calls `workflow.invoke(...)` once
+per email with a run config built by `app/observability.py::email_trace_config` (run name
+`Email: <subject>`, tag `email-processor`, metadata with email id / sender / subject). Tracing is
+off unless the env vars are present. Legacy `LANGCHAIN_TRACING_V2` / `LANGCHAIN_API_KEY` also work.
 
 ---
 

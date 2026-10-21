@@ -1,7 +1,6 @@
 import os
 import uuid
 from datetime import datetime
-from enum import Enum
 from pathlib import Path
 from typing import TypedDict, cast
 
@@ -9,6 +8,8 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field, SecretStr
+
+from app.db.models import ApplicationStatus
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=True)
 
@@ -19,22 +20,9 @@ llm = ChatOpenAI(
     base_url="https://opencode.ai/zen/go/v1",
     default_headers={"x-opencode-session": str(uuid.uuid4())},
     max_retries=3,
+    # Fail a stalled request instead of hanging the pipeline forever.
+    timeout=60,
 )
-
-
-# Status Enum
-class ApplicationStatus(str, Enum):
-    RECOMMENDED = "RECOMMENDED"  # Suggested job (not yet applied)
-    APPLIED = "APPLIED"
-    UNDER_REVIEW = "UNDER_REVIEW"
-    OA = "OA"
-    INTERVIEW = "INTERVIEW"
-    INTERVIEW_PASSED = "INTERVIEW_PASSED"
-    INTERVIEW_REJECTED = "INTERVIEW_REJECTED"
-    OFFER = "OFFER"
-    REJECTED = "REJECTED"
-    WITHDRAWN = "WITHDRAWN"
-    CLOSED = "CLOSED"
 
 
 # State
@@ -97,11 +85,13 @@ class ExtractionResult(TypedDict):
 
 # Nodes
 def classify_email(state: ApplicationState) -> ClassificationResult:
-    try:
-        result = cast(
-            Classifier,
-            classifier_llm.invoke(
-                f"""Analyze whether this email is related to a job application
+    # LLM/transport failures are allowed to propagate to the processor, which
+    # records the email as FAILED (retryable via retry_failed) instead of
+    # silently mislabelling it as "not a job email".
+    result = cast(
+        Classifier,
+        classifier_llm.invoke(
+            f"""Analyze whether this email is related to a job application
 (e.g. confirmation, status update, rejection, offer, OA, interview invite).
 
 Subject: {state.get("email_subject", "")}
@@ -109,14 +99,9 @@ Subject: {state.get("email_subject", "")}
 Body:
 {state.get("email_body", "")}
 """
-            ),
-        )
-        return {"is_application_email": result.is_application_email}
-    except Exception as exc:
-        # Proxy returned a malformed response (e.g. choices=null). Log and skip
-        # this email rather than crashing the graph.
-        print(f"[classify_email] LLM error, skipping email: {exc!r}")
-        return {"is_application_email": False}
+        ),
+    )
+    return {"is_application_email": result.is_application_email}
 
 
 def extract(state: ApplicationState) -> ExtractionResult:

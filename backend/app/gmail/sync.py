@@ -309,15 +309,22 @@ def sync_history(
     session.commit()
 
 
-def full_sync(service, session: Session, email_address: str) -> list[str]:
+def full_sync(
+    service,
+    session: Session,
+    email_address: str,
+    max_messages: int | None = None,
+) -> list[str]:
     """Safe resynchronization after a history cursor has expired.
 
-    Re-reads the entire mailbox (deduped by message id, so no email is lost) and
-    re-anchors the cursor to the mailbox's current history id. The cursor is
-    read *before* listing so anything arriving mid-scan is recovered by the
-    next incremental sync (never missed, only possibly re-fetched).
+    Re-reads the mailbox newest-first (deduped by message id, so no email is
+    lost) and re-anchors the cursor to the mailbox's current history id. The
+    cursor is read *before* listing so anything arriving mid-scan is recovered
+    by the next incremental sync (never missed, only possibly re-fetched).
 
-    Returns the message ids listed (whether or not they were newly persisted).
+    ``max_messages`` optionally bounds the scan to the newest N messages, so a
+    manual sync never walks an entire large mailbox. Returns the message ids
+    listed (whether or not they were newly persisted).
     """
     _lock_cursor(session, email_address)  # serialize with concurrent sync_history
 
@@ -336,6 +343,10 @@ def full_sync(service, session: Session, email_address: str) -> list[str]:
         for message in response.get("messages", []):
             if message.get("id"):
                 message_ids.append(message["id"])
+                if max_messages is not None and len(message_ids) >= max_messages:
+                    break
+        if max_messages is not None and len(message_ids) >= max_messages:
+            break
         page_token = response.get("nextPageToken")
         if not page_token:
             break

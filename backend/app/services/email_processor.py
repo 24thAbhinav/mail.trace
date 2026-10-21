@@ -24,6 +24,7 @@ from app.db.models import (
     utcnow,
 )
 from app.graph.graph import ApplicationState, workflow
+from app.observability import email_trace_config
 
 logger = logging.getLogger(__name__)
 
@@ -241,18 +242,10 @@ def _process_single_email_tx(
         session.refresh(existing_processed)
         return existing_processed
 
-    # 3. Invoke LangGraph workflow
+    # 3. Invoke LangGraph workflow. One invoke == one LangSmith trace; the run
+    #    config (name / tags / metadata) is derived from the email.
     input_state = email_to_state(email)
-    run_name = f"Email: {email.subject[:50]}" if email.subject else f"Email: {email.message_id}"
-    config = {
-        "run_name": run_name,
-        "tags": ["email-processor", "job-tracker"],
-        "metadata": {
-            "email_id": email.message_id,
-            "sender": email.sender_email,
-            "subject": email.subject,
-        },
-    }
+    config = email_trace_config(email)
     graph_output = graph.invoke(input_state, config=config)
 
     is_app_email = bool(graph_output.get("is_application_email"))
